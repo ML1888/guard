@@ -35,11 +35,18 @@ npm install
 
 默认使用隔离工作区并且不写回原项目。需要实际修改项目时，在设置中开启“完成后应用补丁”。API Key 只保存在当前页面状态中，不写入浏览器存储或 EvidenceReport。
 
+## A/B 监督对比
+
+顶部切换到“A/B 对比”后，同一个项目基线和同一个任务会在两个隔离副本中依次运行：左侧是关闭所有监督门禁的直接 Worker，右侧是启用计划约束、范围检查、安全检查、回滚和纠正的 AgentGuard。两侧都会展示实际修改文件、测试证据和风险，且都不会写回源项目。
+
+“载入监督价值案例”会创建一个临时的 VIP 折扣项目，并使用 `mock` Worker 稳定复现“直接运行通过修改测试获得表面 PASS，监督运行回滚越界修改并改正业务代码”。它用于快速说明监督机制，不代表真实 Codex 的随机输出。需要评估真实任务（例如开发五子棋）时，请打开自己的项目、选择 `codex` Worker，再在 A/B 模式提交任务；真实双运行不保证无监督侧一定违规，但可比较两侧产物和监督证据。
+
 ## 主要接口
 
 - `POST /api/system/select-directory`：打开本机文件夹选择器。
 - `POST /api/projects/inspect`：只读返回有限深度的项目文件树和 Git 状态。
 - `POST /api/runs`：创建真实 AgentGuard 运行。
+- `POST /api/demos/supervision-comparison`：创建可复现的监督价值演示项目。
 - `GET /api/runs/{run_id}/events`：通过 SSE 推送运行、监督阶段和报告。
 - `POST /api/runs/{run_id}/cancel`：在安全检查点请求停止运行。
 

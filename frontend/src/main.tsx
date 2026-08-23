@@ -28,6 +28,7 @@ import {
   CheckCircleFilled,
   CloseCircleFilled,
   DeleteOutlined,
+  ExperimentOutlined,
   FileOutlined,
   FolderOpenOutlined,
   FolderOutlined,
@@ -37,14 +38,16 @@ import {
   SendOutlined,
   SettingOutlined,
   StopOutlined,
+  ThunderboltOutlined,
   UserOutlined,
+  WarningFilled,
 } from "@ant-design/icons";
 import "antd/dist/reset.css";
 import "./styles.css";
 
 type RunState = "IDLE" | "QUEUED" | "RUNNING" | "PASS" | "FAIL" | "NEEDS_HUMAN" | "FAILED" | "CANCEL_REQUESTED";
-type Trace = { stage: string; status: string; started_at: string; duration_ms: number; payload: Record<string, unknown> };
-type RunEvent = { id: string; kind: "run" | "trace" | "report" | "runtime_error"; at: number; payload: Trace | Record<string, unknown> };
+type Trace = { stage: string; status: string; started_at: string; duration_ms: number; payload: Record<string, unknown>; lane?: "direct" | "supervised" };
+type RunEvent = { id: string; kind: "run" | "trace" | "report" | "runtime_error" | "comparison" | "lane_report" | "comparison_report"; at: number; payload: Trace | Record<string, unknown> };
 type ProjectNode = { title: string; key: string; is_leaf: boolean; children?: ProjectNode[] };
 type ProjectInfo = { path: string; name: string; is_git: boolean; tree: ProjectNode[] };
 type ChatMessage = {
@@ -70,6 +73,15 @@ type Settings = {
   max_diff_lines: number;
   worker_timeout_seconds: number;
 };
+
+type WorkspaceMode = "supervised" | "comparison";
+type ComparisonLane = { status: string; message: string; report: Record<string, unknown> | null };
+type ComparisonLanes = { direct: ComparisonLane; supervised: ComparisonLane };
+
+const emptyComparisonLanes = (): ComparisonLanes => ({
+  direct: { status: "WAITING", message: "等待直接运行", report: null },
+  supervised: { status: "WAITING", message: "等待 AgentGuard", report: null },
+});
 
 const api = axios.create({ baseURL: "/api" });
 
@@ -193,7 +205,90 @@ function ReportDetails({ report }: { report: Record<string, unknown> }) {
   </div>;
 }
 
+function ComparisonBoard({ lanes, traces, running }: { lanes: ComparisonLanes; traces: Trace[]; running: boolean }) {
+  const direct = lanes.direct.report;
+  const supervised = lanes.supervised.report;
+  const directFiles = direct ? stringList(direct.changed_files) : [];
+  const supervisedFiles = supervised ? stringList(supervised.changed_files) : [];
+  const directReview = asRecord(direct?.final_review);
+  const supervisedReview = asRecord(supervised?.final_review);
+  const directEvidence = stringList(directReview.test_evidence);
+  const supervisedEvidence = stringList(supervisedReview.test_evidence);
+  const directScopeViolation = Boolean(direct?.passive_scope_violation || direct?.passive_forbidden_path_touch);
+  const directSecurity = direct ? stringList(direct.passive_security_findings) : [];
+  const directMissing = direct ? stringList(direct.passive_required_commands_missing) : [];
+  const interventions = supervised && Array.isArray(supervised.interventions) ? supervised.interventions.length : 0;
+  const rollback = asRecord(supervised?.rollback);
+  const rollbackApplied = Boolean(rollback.rollback_applied);
+  const directDecision = String(direct?.final_decision || (running ? "RUNNING" : "WAITING"));
+  const supervisedDecision = String(supervised?.final_decision || (running ? "RUNNING" : "WAITING"));
+  const directRisk = directScopeViolation || directSecurity.length > 0 || directMissing.length > 0;
+  const supervisedTraceCount = traces.filter((item) => item.lane === "supervised").length;
+
+  let conclusion = "两侧将从同一份项目基线开始，结果不会写回源项目。";
+  if (direct && supervised && directRisk && (interventions > 0 || rollbackApplied)) {
+    conclusion = "直接运行虽然可能显示 PASS，但存在越界或证据缺失；AgentGuard 已介入并回滚风险修改，交付结果更可信。";
+  } else if (direct && supervised && !directRisk) {
+    conclusion = "本次直接运行未触发明显违规；AgentGuard 仍提供了计划约束、验证证据和可审计结果。";
+  }
+
+  const lane = (
+    kind: "direct" | "supervised",
+    title: string,
+    subtitle: string,
+    laneState: ComparisonLane,
+    report: Record<string, unknown> | null,
+    decision: string,
+    files: string[],
+    evidence: string[],
+  ) => {
+    const isDirect = kind === "direct";
+    const decisionColor = decision === "PASS" && (!isDirect || !directRisk) ? "success" : decision === "RUNNING" ? "processing" : decision === "WAITING" ? "default" : "warning";
+    return <section className={`comparison-lane ${kind}`}>
+      <div className="lane-header">
+        <span className="lane-icon">{isDirect ? <ThunderboltOutlined /> : <SafetyCertificateFilled />}</span>
+        <div><b>{title}</b><span>{subtitle}</span></div>
+        <Tag color={decisionColor}>{isDirect && decision === "PASS" && directRisk ? "表面 PASS" : decision}</Tag>
+      </div>
+      <div className="lane-status"><i className={laneState.status.toLowerCase()} />{laneState.message}</div>
+      <div className="lane-metrics">
+        <div><span>修改文件</span><b>{files.length}</b></div>
+        <div><span>验证证据</span><b>{evidence.length}</b></div>
+        <div><span>{isDirect ? "事后风险" : "监督介入"}</span><b>{isDirect ? Number(directRisk) : interventions}</b></div>
+        <div><span>{isDirect ? "监督门禁" : "安全回滚"}</span><b>{isDirect ? "0" : rollbackApplied ? "已执行" : "未触发"}</b></div>
+      </div>
+      <div className="lane-evidence">
+        {!report && <Skeleton active paragraph={{ rows: 4 }} title={false} />}
+        {report && <>
+          {isDirect && <div className={`finding ${directRisk ? "danger" : "ok"}`}>
+            {directRisk ? <WarningFilled /> : <CheckCircleFilled />}
+            <span>{directScopeViolation ? "检测到允许范围外的修改，但直接运行不会阻止它" : directRisk ? "存在未处理的交付风险" : "未发现明显越界修改"}</span>
+          </div>}
+          {!isDirect && <div className={`finding ${interventions || rollbackApplied ? "protected" : "ok"}`}>
+            <SafetyCertificateFilled />
+            <span>{interventions || rollbackApplied ? `已执行 ${interventions} 次介入${rollbackApplied ? "并完成回滚" : ""}` : "监督门禁未发现需要阻止的行为"}</span>
+          </div>}
+          <div className="evidence-block"><b>实际修改</b>{files.length ? files.map((file) => <code key={file}>{file}</code>) : <span>无文件变更</span>}</div>
+          <div className="evidence-block"><b>测试结果</b>{evidence.length ? evidence.map((item) => <span key={item}>{item}</span>) : <span>{String(report.verification_status || "UNKNOWN")}</span>}</div>
+          {isDirect && directSecurity.map((item) => <span className="risk-line" key={item}>{item}</span>)}
+          {isDirect && directMissing.map((item) => <span className="risk-line" key={item}>Worker 未主动执行：{item}</span>)}
+        </>}
+      </div>
+      <div className="lane-footer">{isDirect ? "监督门禁关闭 · 仅事后测量" : `${supervisedTraceCount} 个监督阶段 · 可回滚`}</div>
+    </section>;
+  };
+
+  return <div className="comparison-board">
+    <div className="comparison-conclusion"><ExperimentOutlined /><span><b>对比结论</b>{conclusion}</span></div>
+    <div className="comparison-grid">
+      {lane("direct", "无监督直接运行", "Raw Codex / Worker", lanes.direct, direct, directDecision, directFiles, directEvidence)}
+      {lane("supervised", "AgentGuard 监督运行", "门禁、回滚与纠正", lanes.supervised, supervised, supervisedDecision, supervisedFiles, supervisedEvidence)}
+    </div>
+  </div>;
+}
+
 function Console() {
+  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("supervised");
   const [project, setProject] = useState<ProjectInfo | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [prompt, setPrompt] = useState("");
@@ -206,6 +301,8 @@ function Console() {
   const [folderPicking, setFolderPicking] = useState(false);
   const [apiOnline, setApiOnline] = useState<boolean | null>(null);
   const [effectiveModel, setEffectiveModel] = useState("");
+  const [comparisonLanes, setComparisonLanes] = useState<ComparisonLanes>(emptyComparisonLanes);
+  const [demoLoading, setDemoLoading] = useState(false);
   const [messageApi, contextHolder] = message.useMessage();
   const streamRef = useRef<EventSource | null>(null);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
@@ -248,9 +345,44 @@ function Console() {
     setMessages([]);
     setTraces([]);
     setReport(null);
+    setComparisonLanes(emptyComparisonLanes());
     setRunState("IDLE");
     if (!inspected.data.is_git) messageApi.success("已打开普通文件夹，运行时将自动创建临时监督基线");
     else messageApi.success(`已打开 ${inspected.data.name}`);
+  };
+
+  const switchWorkspaceMode = (mode: WorkspaceMode) => {
+    if (isRunning || mode === workspaceMode) return;
+    setWorkspaceMode(mode);
+    setMessages([]);
+    setTraces([]);
+    setReport(null);
+    setComparisonLanes(emptyComparisonLanes());
+    setRunId("");
+    setRunState("IDLE");
+  };
+
+  const loadComparisonDemo = async () => {
+    if (isRunning) return;
+    setDemoLoading(true);
+    try {
+      const { data } = await api.post("/demos/supervision-comparison");
+      setWorkspaceMode("comparison");
+      setSettings((old) => ({
+        ...old,
+        worker: data.worker || "mock",
+        apply_patch: false,
+        allowed_globs: (data.allowed_globs || ["src/**"]).join("\n"),
+        test_commands: (data.test_commands || []).join("\n"),
+      }));
+      setPrompt(String(data.task || ""));
+      await inspectProject(String(data.repo_path));
+      messageApi.success("已载入监督价值对比案例");
+    } catch (error) {
+      messageApi.error(axios.isAxiosError(error) ? String(error.response?.data?.detail || error.message) : "无法载入对比案例");
+    } finally {
+      setDemoLoading(false);
+    }
   };
 
   const pickProject = async () => {
@@ -272,7 +404,7 @@ function Console() {
     const stream = new EventSource(`/api/runs/${id}/events`);
     streamRef.current = stream;
 
-    (["run", "trace", "report", "runtime_error"] as const).forEach((kind) => {
+    (["run", "trace", "report", "runtime_error", "comparison", "lane_report", "comparison_report"] as const).forEach((kind) => {
       stream.addEventListener(kind, (raw) => {
         if (!(raw instanceof MessageEvent)) return;
         let event: RunEvent;
@@ -281,15 +413,18 @@ function Console() {
           const payload = asRecord(event.payload);
           const nextState = String(payload.status || "RUNNING") as RunState;
           setRunState(nextState);
-          updateMessage(assistantId, { content: String(payload.message || "AgentGuard 正在运行"), status: nextState });
+          if (workspaceMode !== "comparison") updateMessage(assistantId, { content: String(payload.message || "AgentGuard 正在运行"), status: nextState });
+          else updateMessage(assistantId, { status: nextState });
         }
         if (event.kind === "trace") {
           const trace = event.payload as Trace;
           setTraces((old) => [...old, trace]);
-          updateMessage(assistantId, {
-            content: `${stageNames[trace.stage] || trace.stage}\n${payloadText(trace.payload)}`,
-            status: "RUNNING",
-          });
+          if (workspaceMode !== "comparison") {
+            updateMessage(assistantId, {
+              content: `${stageNames[trace.stage] || trace.stage}\n${payloadText(trace.payload)}`,
+              status: "RUNNING",
+            });
+          }
         }
         if (event.kind === "report") {
           const nextReport = asRecord(event.payload);
@@ -302,6 +437,34 @@ function Console() {
           const errorText = String(asRecord(event.payload).message || "运行失败");
           setRunState("FAILED");
           updateMessage(assistantId, { content: errorText, status: "FAILED" });
+        }
+        if (event.kind === "comparison") {
+          const payload = asRecord(event.payload);
+          const laneName = String(payload.lane);
+          if (laneName === "direct" || laneName === "supervised") {
+            setComparisonLanes((old) => ({
+              ...old,
+              [laneName]: { ...old[laneName], status: String(payload.status || "RUNNING"), message: String(payload.message || "运行中") },
+            }));
+          }
+        }
+        if (event.kind === "lane_report") {
+          const payload = asRecord(event.payload);
+          const laneName = String(payload.lane);
+          const laneReport = asRecord(payload.report);
+          if (laneName === "direct" || laneName === "supervised") {
+            setComparisonLanes((old) => ({
+              ...old,
+              [laneName]: { status: String(laneReport.final_decision || "COMPLETED"), message: laneName === "direct" ? "直接运行已完成" : "监督运行已完成", report: laneReport },
+            }));
+          }
+        }
+        if (event.kind === "comparison_report") {
+          const payload = asRecord(event.payload);
+          const supervised = asRecord(payload.supervised);
+          const decision = String(supervised.final_decision || "PASS") as RunState;
+          setRunState(decision);
+          updateMessage(assistantId, { content: "A/B 对比已完成。下方结果展示两种运行方式的实际差异。", status: decision });
         }
       });
     });
@@ -324,6 +487,7 @@ function Console() {
     setPrompt("");
     setTraces([]);
     setReport(null);
+    setComparisonLanes(emptyComparisonLanes());
     setRunState("QUEUED");
 
     try {
@@ -342,6 +506,7 @@ function Console() {
         model: settings.model,
         api_base_url: settings.api_base_url,
         api_key: settings.api_key,
+        comparison_mode: workspaceMode === "comparison",
         conversation_history: messages.slice(-8).map((item) => ({
           role: item.role,
           content: item.content,
@@ -371,6 +536,7 @@ function Console() {
     setMessages([]);
     setTraces([]);
     setReport(null);
+    setComparisonLanes(emptyComparisonLanes());
     setRunId("");
     setRunState("IDLE");
   };
@@ -389,15 +555,25 @@ function Console() {
         {project && <Tag icon={<BranchesOutlined />} color={project.is_git ? "success" : "cyan"}>{project.is_git ? "Git 项目" : "普通文件夹"}</Tag>}
       </div>
       <div className="header-actions">
+        <Segmented
+          className="workspace-mode-switch"
+          value={workspaceMode}
+          disabled={isRunning}
+          onChange={(value) => switchWorkspaceMode(value as WorkspaceMode)}
+          options={[
+            { label: "单次监督", value: "supervised", icon: <SafetyCertificateFilled /> },
+            { label: "A/B 对比", value: "comparison", icon: <ExperimentOutlined /> },
+          ]}
+        />
         <span className={`connection ${apiOnline === true ? "online" : apiOnline === false ? "offline" : ""}`}>
           <i />{apiOnline === true ? "服务已连接" : apiOnline === false ? "服务未连接" : "连接中"}
         </span>
-        <Tag color="green" icon={<SafetyCertificateFilled />}>监督启用</Tag>
+        <Tag color={workspaceMode === "comparison" ? "blue" : "green"} icon={workspaceMode === "comparison" ? <ExperimentOutlined /> : <SafetyCertificateFilled />}>{workspaceMode === "comparison" ? "同基线对比" : "监督启用"}</Tag>
         <Tooltip title="任务设置"><Button type="text" icon={<SettingOutlined />} onClick={() => setSettingsOpen(true)} /></Tooltip>
       </div>
     </header>
 
-    <div className="workspace">
+    <div className={`workspace ${workspaceMode === "comparison" ? "compare-mode" : ""}`}>
       <aside className="project-sidebar">
         <div className="pane-title"><span>项目</span><Tooltip title="打开项目"><Button type="text" size="small" icon={<FolderOpenOutlined />} onClick={pickProject} disabled={isRunning} /></Tooltip></div>
         {project ? <>
@@ -405,14 +581,16 @@ function Console() {
             <b>{project.name}</b>
             <Tooltip title={project.path}><span>{project.path}</span></Tooltip>
           </div>
-          {!project.is_git && <Alert type="info" showIcon message="使用临时监督基线" description="不会在源文件夹创建 .git" />}
+          {workspaceMode === "comparison"
+            ? <Alert type="info" showIcon message="同基线双运行" description="两个结果均不写回源项目" />
+            : !project.is_git && <Alert type="info" showIcon message="使用临时监督基线" description="不会在源文件夹创建 .git" />}
           <div className="file-tree">
             <Tree showIcon blockNode defaultExpandAll={false} treeData={treeData} />
           </div>
         </> : <div className="project-empty"><FolderOpenOutlined /><span>未打开项目</span></div>}
         <div className="sidebar-footer">
-          <span>执行方式</span><b>{!project?.is_git ? "临时监督基线" : settings.execution_mode === "isolated" ? "隔离工作区" : "原地执行"}</b>
-          <span>写回项目</span><b>{settings.apply_patch ? "是" : "否"}</b>
+          <span>执行方式</span><b>{workspaceMode === "comparison" ? "同基线双副本" : !project?.is_git ? "临时监督基线" : settings.execution_mode === "isolated" ? "隔离工作区" : "原地执行"}</b>
+          <span>写回项目</span><b>{workspaceMode === "comparison" ? "否" : settings.apply_patch ? "是" : "否"}</b>
         </div>
       </aside>
 
@@ -420,6 +598,18 @@ function Console() {
         <div className="chat-toolbar">
           <div><b>{project?.name || "新任务"}</b><span>{runId ? `运行 ${runId.slice(0, 8)}` : "AgentGuard 会话"}</span></div>
           <Space size={4}>
+            <Segmented
+              className="mobile-mode-switch"
+              size="small"
+              value={workspaceMode}
+              disabled={isRunning}
+              onChange={(value) => switchWorkspaceMode(value as WorkspaceMode)}
+              options={[
+                { label: "监督", value: "supervised", icon: <SafetyCertificateFilled /> },
+                { label: "对比", value: "comparison", icon: <ExperimentOutlined /> },
+              ]}
+            />
+            {workspaceMode === "comparison" && <Button size="small" icon={<ExperimentOutlined />} loading={demoLoading} disabled={isRunning} onClick={loadComparisonDemo}>载入对比案例</Button>}
             {isRunning && <Tooltip title="停止任务"><Button danger type="text" icon={<StopOutlined />} onClick={cancelRun} /></Tooltip>}
             <Tooltip title="清空对话"><Button type="text" icon={<DeleteOutlined />} disabled={isRunning || messages.length === 0} onClick={clearConversation} /></Tooltip>
           </Space>
@@ -427,11 +617,11 @@ function Console() {
 
         <section className="message-list">
           {messages.length === 0 ? <div className="welcome-state">
-            <span className="welcome-mark"><RobotOutlined /></span>
-            <h1>准备开始</h1>
-            <div className="suggestion-list">
-              {suggestions.map((item) => <button key={item} disabled={!project} onClick={() => sendMessage(item)}>{item}<SendOutlined /></button>)}
-            </div>
+            <span className="welcome-mark">{workspaceMode === "comparison" ? <ExperimentOutlined /> : <RobotOutlined />}</span>
+            <h1>{workspaceMode === "comparison" ? "比较监督前后的真实差异" : "准备开始"}</h1>
+            {workspaceMode === "comparison"
+              ? <Button type="primary" icon={<ExperimentOutlined />} loading={demoLoading} onClick={loadComparisonDemo}>载入监督价值案例</Button>
+              : <div className="suggestion-list">{suggestions.map((item) => <button key={item} disabled={!project} onClick={() => sendMessage(item)}>{item}<SendOutlined /></button>)}</div>}
           </div> : messages.map((item) => <article key={item.id} className={`message-row ${item.role}`}>
             <div className="avatar">{item.role === "user" ? <UserOutlined /> : <SafetyCertificateFilled />}</div>
             <div className="message-content">
@@ -446,6 +636,7 @@ function Console() {
               {item.report && <ReportDetails report={item.report} />}
             </div>
           </article>)}
+          {workspaceMode === "comparison" && messages.length > 0 && <ComparisonBoard lanes={comparisonLanes} traces={traces} running={isRunning} />}
           <div ref={chatEndRef} />
         </section>
 
@@ -464,7 +655,7 @@ function Console() {
             <div className="composer-footer">
               <div className="composer-mode">
                 <Tag>{settings.worker === "codex" ? (settings.model || effectiveModel || "Codex Worker") : settings.worker}</Tag>
-                <span>{settings.apply_patch ? "完成后写回" : "仅生成补丁"}</span>
+                <span>{workspaceMode === "comparison" ? "双副本 · 不写回" : settings.apply_patch ? "完成后写回" : "仅生成补丁"}</span>
               </div>
               <Tooltip title={isRunning ? "任务正在运行" : "发送任务"}>
                 <Button type="primary" shape="circle" icon={isRunning ? <LoadingOutlined spin /> : <SendOutlined />} disabled={!project || !prompt.trim() || isRunning} onClick={() => sendMessage()} />
@@ -474,7 +665,7 @@ function Console() {
         </div>
       </main>
 
-      <aside className="supervision-pane">
+      {workspaceMode === "supervised" && <aside className="supervision-pane">
         <div className="pane-title"><span>实时监督</span><Tag color={runState === "PASS" ? "success" : isRunning ? "processing" : runState === "FAILED" || runState === "FAIL" ? "error" : "default"}>{stateLabels[runState]}</Tag></div>
         <div className="run-overview">
           <span className={`run-indicator ${runState.toLowerCase()}`}>{isRunning ? <LoadingOutlined spin /> : runState === "PASS" ? <CheckCircleFilled /> : runState === "FAILED" || runState === "FAIL" ? <CloseCircleFilled /> : <SafetyCertificateFilled />}</span>
@@ -492,11 +683,12 @@ function Console() {
           <b>{String(report.functional_evidence || "UNKNOWN")}</b>
           <small>{stringList(report.changed_files).length} 个变更文件</small>
         </div>}
-      </aside>
+      </aside>}
     </div>
 
     <Drawer title="任务与模型设置" open={settingsOpen} onClose={() => setSettingsOpen(false)} width={480}>
       <Form layout="vertical">
+        {workspaceMode === "comparison" && <Alert className="non-git-setting-note" type="info" showIcon message="A/B 对比模式" description="直接运行和监督运行使用同一基线的两个隔离副本，均不会写回源项目。" />}
         {project && !project.is_git && <Alert className="non-git-setting-note" type="info" showIcon message="当前为普通文件夹" description="AgentGuard 将在临时副本中建立 Git 基线；只有监督通过且开启写回时才修改源文件。" />}
         <Form.Item label="执行 Worker"><Select value={settings.worker} onChange={(worker) => setSettings((old) => ({ ...old, worker }))} options={[
           { value: "codex", label: "Codex Worker" },
@@ -507,8 +699,8 @@ function Console() {
         <Form.Item label="API 地址"><Input value={settings.api_base_url} onChange={(event) => setSettings((old) => ({ ...old, api_base_url: event.target.value }))} placeholder="可选：OpenAI 兼容端点" /></Form.Item>
         <Form.Item label="API Key"><Input.Password value={settings.api_key} onChange={(event) => setSettings((old) => ({ ...old, api_key: event.target.value }))} placeholder="仅在本次页面会话中使用" /></Form.Item>
         <Divider />
-        <Form.Item label="执行模式"><Segmented block value={settings.execution_mode} onChange={(execution_mode) => setSettings((old) => ({ ...old, execution_mode: execution_mode as Settings["execution_mode"] }))} options={[{ label: "隔离工作区", value: "isolated" }, { label: "原地执行", value: "in-place" }]} /></Form.Item>
-        <div className="setting-switch"><div><b>完成后应用补丁</b><span>通过监督门禁后写回所选项目</span></div><Switch checked={settings.apply_patch} onChange={(apply_patch) => setSettings((old) => ({ ...old, apply_patch }))} /></div>
+        <Form.Item label="执行模式"><Segmented block disabled={workspaceMode === "comparison"} value={workspaceMode === "comparison" ? "isolated" : settings.execution_mode} onChange={(execution_mode) => setSettings((old) => ({ ...old, execution_mode: execution_mode as Settings["execution_mode"] }))} options={[{ label: "隔离工作区", value: "isolated" }, { label: "原地执行", value: "in-place" }]} /></Form.Item>
+        <div className="setting-switch"><div><b>完成后应用补丁</b><span>{workspaceMode === "comparison" ? "对比模式固定不写回" : "通过监督门禁后写回所选项目"}</span></div><Switch disabled={workspaceMode === "comparison"} checked={workspaceMode === "comparison" ? false : settings.apply_patch} onChange={(apply_patch) => setSettings((old) => ({ ...old, apply_patch }))} /></div>
         <Form.Item label="允许写入路径"><Input.TextArea rows={3} value={settings.allowed_globs} onChange={(event) => setSettings((old) => ({ ...old, allowed_globs: event.target.value }))} placeholder="每行一个 glob" /></Form.Item>
         <Form.Item label="验证命令"><Input.TextArea rows={3} value={settings.test_commands} onChange={(event) => setSettings((old) => ({ ...old, test_commands: event.target.value }))} placeholder="每行一条命令" /></Form.Item>
         <div className="numeric-settings">
