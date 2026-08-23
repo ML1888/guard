@@ -224,12 +224,20 @@ function ComparisonBoard({ lanes, traces, running }: { lanes: ComparisonLanes; t
   const supervisedDecision = String(supervised?.final_decision || (running ? "RUNNING" : "WAITING"));
   const directRisk = directScopeViolation || directSecurity.length > 0 || directMissing.length > 0;
   const supervisedTraceCount = traces.filter((item) => item.lane === "supervised").length;
+  const directEvaluation = asRecord(direct?.delivery_evaluation);
+  const supervisedEvaluation = asRecord(supervised?.delivery_evaluation);
+  const directScore = typeof directEvaluation.score === "number" ? directEvaluation.score : null;
+  const supervisedScore = typeof supervisedEvaluation.score === "number" ? supervisedEvaluation.score : null;
 
   let conclusion = "两侧将从同一份项目基线开始，结果不会写回源项目。";
-  if (direct && supervised && directRisk && (interventions > 0 || rollbackApplied)) {
+  if (direct && supervised && directScore !== null && supervisedScore !== null && supervisedScore > directScore) {
+    conclusion = `同一验收契约下，AgentGuard 自动验收得分比 Direct 高 ${supervisedScore - directScore} 分；失败证据触发了受监督的检查与纠正。`;
+  } else if (direct && supervised && directRisk && (interventions > 0 || rollbackApplied)) {
     conclusion = "直接运行虽然可能显示 PASS，但存在越界或证据缺失；AgentGuard 已介入并回滚风险修改，交付结果更可信。";
-  } else if (direct && supervised && !directRisk) {
-    conclusion = "本次直接运行未触发明显违规；AgentGuard 仍提供了计划约束、验证证据和可审计结果。";
+  } else if (direct && supervised && directScore !== null && directScore === supervisedScore) {
+    conclusion = `本次两侧自动验收得分同为 ${directScore}；AgentGuard 的额外价值体现在约束执行、证据链和可回滚性，而非人为制造 Direct 缺陷。`;
+  } else if (direct && supervised) {
+    conclusion = "本次任务没有匹配专用功能评价器；请结合项目测试、越界风险和监督证据判断结果。";
   }
 
   const lane = (
@@ -243,6 +251,14 @@ function ComparisonBoard({ lanes, traces, running }: { lanes: ComparisonLanes; t
     evidence: string[],
   ) => {
     const isDirect = kind === "direct";
+    const evaluation = asRecord(report?.delivery_evaluation);
+    const metrics = asRecord(report?.execution_metrics);
+    const score = typeof evaluation.score === "number" ? evaluation.score : null;
+    const checks = Array.isArray(evaluation.checks) ? evaluation.checks.map(asRecord) : [];
+    const failedChecks = checks.filter((item) => !item.passed);
+    const previewUrl = String(evaluation.preview_url || "");
+    const elapsed = typeof metrics.elapsed_seconds === "number" ? `${metrics.elapsed_seconds.toFixed(1)}s` : "—";
+    const attempts = typeof metrics.worker_attempts === "number" ? metrics.worker_attempts : 1;
     const decisionColor = decision === "PASS" && (!isDirect || !directRisk) ? "success" : decision === "RUNNING" ? "processing" : decision === "WAITING" ? "default" : "warning";
     return <section className={`comparison-lane ${kind}`}>
       <div className="lane-header">
@@ -252,10 +268,10 @@ function ComparisonBoard({ lanes, traces, running }: { lanes: ComparisonLanes; t
       </div>
       <div className="lane-status"><i className={laneState.status.toLowerCase()} />{laneState.message}</div>
       <div className="lane-metrics">
-        <div><span>修改文件</span><b>{files.length}</b></div>
-        <div><span>验证证据</span><b>{evidence.length}</b></div>
+        <div><span>自动验收</span><b>{score === null ? "未评测" : `${score}/100`}</b></div>
+        <div><span>缺失能力</span><b>{score === null ? "—" : failedChecks.length}</b></div>
+        <div><span>运行耗时</span><b>{elapsed}</b></div>
         <div><span>{isDirect ? "事后风险" : "监督介入"}</span><b>{isDirect ? Number(directRisk) : interventions}</b></div>
-        <div><span>{isDirect ? "监督门禁" : "安全回滚"}</span><b>{isDirect ? "0" : rollbackApplied ? "已执行" : "未触发"}</b></div>
       </div>
       <div className="lane-evidence">
         {!report && <Skeleton active paragraph={{ rows: 4 }} title={false} />}
@@ -270,11 +286,23 @@ function ComparisonBoard({ lanes, traces, running }: { lanes: ComparisonLanes; t
           </div>}
           <div className="evidence-block"><b>实际修改</b>{files.length ? files.map((file) => <code key={file}>{file}</code>) : <span>无文件变更</span>}</div>
           <div className="evidence-block"><b>测试结果</b>{evidence.length ? evidence.map((item) => <span key={item}>{item}</span>) : <span>{String(report.verification_status || "UNKNOWN")}</span>}</div>
+          {checks.length > 0 && <div className="contract-results">
+            <div className="contract-title"><b>统一功能验收</b><span>{String(evaluation.passed || 0)}/{String(evaluation.total || checks.length)} 通过</span></div>
+            {checks.map((item) => <div className={`contract-check ${item.passed ? "pass" : "fail"}`} key={String(item.id)}>
+              {item.passed ? <CheckCircleFilled /> : <CloseCircleFilled />}
+              <span><b>{String(item.label)}</b><small>{String(item.detail || "")}</small></span>
+            </div>)}
+            <small className="evaluation-limit">{String(evaluation.limitations || "")}</small>
+          </div>}
           {isDirect && directSecurity.map((item) => <span className="risk-line" key={item}>{item}</span>)}
           {isDirect && directMissing.map((item) => <span className="risk-line" key={item}>Worker 未主动执行：{item}</span>)}
+          {previewUrl && <div className="artifact-preview">
+            <div><b>可操作成品</b><span>在隔离 iframe 中运行</span></div>
+            <iframe src={previewUrl} title={`${title}成品预览`} sandbox="allow-scripts" />
+          </div>}
         </>}
       </div>
-      <div className="lane-footer">{isDirect ? "监督门禁关闭 · 仅事后测量" : `${supervisedTraceCount} 个监督阶段 · 可回滚`}</div>
+      <div className="lane-footer">{isDirect ? `1 次 Worker · 监督门禁关闭 · 仅事后测量` : `${attempts} 次 Worker · ${supervisedTraceCount} 个监督阶段 · ${rollbackApplied ? "已执行安全回滚" : "具备回滚能力"}`}</div>
     </section>;
   };
 

@@ -26,9 +26,11 @@ from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
+
+from artifact_evaluator import build_evaluation_profile, evaluate_project
 
 # Some Windows Python installations map .js to text/plain. Browsers reject ES
 # modules with that MIME type, so register the production asset types explicitly.
@@ -393,6 +395,13 @@ def prepare_non_git_repository(live: LiveRun) -> Path:
             "普通文件夹复制失败。请避免选择包含大量日志或失效目录联接的上级工作区，"
             "并尽量直接选择需要修改的项目文件夹。"
         ) from exc
+    if stats["file_count"] == 0:
+        seed = repo / "src" / "agentguard_project_seed.txt"
+        seed.parent.mkdir(parents=True, exist_ok=True)
+        seed.write_text(
+            "Temporary AgentGuard seed for an empty project. Generated application files may be added anywhere allowed by the task.\n",
+            encoding="utf-8",
+        )
     _run_command(["git", "init"], repo)
     _run_command(["git", "config", "core.autocrlf", "false"], repo)
     git_exclude = repo / ".git" / "info" / "exclude"
@@ -514,6 +523,24 @@ def apply_non_git_changes(live: LiveRun) -> dict[str, Any]:
     }
 
 
+def effective_allowed_globs(request: RunRequest) -> list[str]:
+    patterns = list(request.allowed_globs)
+    if "**/*" in patterns and "*" not in patterns:
+        patterns.append("*")
+    return patterns
+
+
+def effective_test_commands(request: RunRequest) -> list[str]:
+    commands = list(request.test_commands)
+    profile = build_evaluation_profile(request.task)
+    if profile.get("id") == "gomoku-web-v1":
+        evaluator = Path(__file__).with_name("artifact_evaluator.py").resolve()
+        command = f'python "{evaluator}" --profile gomoku-web-v1 .'
+        if command not in commands:
+            commands.append(command)
+    return commands
+
+
 def write_ui_task_file(repo: Path, run_id: str, request: RunRequest) -> Path:
     task_file = repo / ".agent-review" / "ui-tasks" / f"{run_id}.toml"
     task_file.parent.mkdir(parents=True, exist_ok=True)
@@ -523,20 +550,44 @@ def write_ui_task_file(repo: Path, run_id: str, request: RunRequest) -> Path:
             f"{turn.role.upper()}: {turn.content}" for turn in request.conversation_history
         )
         summary = f"{request.task}\n\nPrevious conversation context (use only when relevant):\n{history}"
+    profile = build_evaluation_profile(request.task)
+    acceptance = [request.task, *profile.get("acceptance_criteria", [])]
+    if profile.get("acceptance_criteria"):
+        contract = "\n".join(f"{index}. {item}" for index, item in enumerate(profile["acceptance_criteria"], start=1))
+        summary = f"{summary}\n\n系统生成的公平对比验收契约（Direct 与 AgentGuard 完全相同）：\n{contract}"
     task_file.write_text(
         "\n".join(
             [
                 f"summary = {json.dumps(summary, ensure_ascii=False)}",
                 f"goals = {json.dumps([request.task], ensure_ascii=False)}",
-                f"acceptance_criteria = {json.dumps([request.task], ensure_ascii=False)}",
-                f"allowed_paths = {json.dumps(request.allowed_globs, ensure_ascii=False)}",
-                f"required_tests = {json.dumps(request.test_commands, ensure_ascii=False)}",
+                f"acceptance_criteria = {json.dumps(acceptance, ensure_ascii=False)}",
+                f"allowed_paths = {json.dumps(effective_allowed_globs(request), ensure_ascii=False)}",
+                f"required_tests = {json.dumps(effective_test_commands(request), ensure_ascii=False)}",
                 "",
             ]
         ),
         encoding="utf-8",
     )
     return task_file
+
+
+def attach_delivery_evaluation(
+    report: dict[str, Any], repo: Path, request: RunRequest, run_id: str, lane: str, elapsed_seconds: float,
+) -> None:
+    profile = build_evaluation_profile(request.task)
+    evaluation = evaluate_project(repo, profile)
+    entry = str(evaluation.get("preview_entry", ""))
+    if entry:
+        evaluation["preview_url"] = f"/api/runs/{run_id}/artifacts/{lane}/{entry}"
+    report["evaluation_profile"] = profile
+    report["delivery_evaluation"] = evaluation
+    metrics = report.get("execution_metrics")
+    if not isinstance(metrics, dict):
+        metrics = {}
+        report["execution_metrics"] = metrics
+    metrics["elapsed_seconds"] = round(elapsed_seconds, 2)
+    attempts = report.get("worker_attempts")
+    metrics["worker_attempts"] = int(attempts) if isinstance(attempts, (int, float)) else len(report.get("repair_round_summaries", [])) + 1
 
 
 def configure_worker_environment(request: RunRequest) -> None:
@@ -570,12 +621,30 @@ def comparison_summary(direct: dict[str, Any], supervised: dict[str, Any]) -> di
     interventions = len(supervised.get("interventions", []))
     rollback = supervised.get("rollback", {})
     rollback_applied = bool(isinstance(rollback, dict) and rollback.get("rollback_applied"))
+    direct_evaluation = direct.get("delivery_evaluation", {})
+    supervised_evaluation = supervised.get("delivery_evaluation", {})
+    direct_score = direct_evaluation.get("score") if isinstance(direct_evaluation, dict) else None
+    supervised_score = supervised_evaluation.get("score") if isinstance(supervised_evaluation, dict) else None
     return {
         "direct_findings": direct_findings,
         "supervised_interventions": interventions,
         "rollback_applied": rollback_applied,
         "supervised_decision": supervised.get("final_decision", "UNKNOWN"),
-        "value_demonstrated": bool(direct_findings or interventions or rollback_applied),
+        "direct_functional_score": direct_score,
+        "supervised_functional_score": supervised_score,
+        "functional_score_delta": (
+            supervised_score - direct_score
+            if isinstance(direct_score, (int, float)) and isinstance(supervised_score, (int, float))
+            else None
+        ),
+        "value_demonstrated": bool(
+            direct_findings or interventions or rollback_applied
+            or (
+                isinstance(direct_score, (int, float))
+                and isinstance(supervised_score, (int, float))
+                and supervised_score > direct_score
+            )
+        ),
     }
 
 
@@ -588,8 +657,8 @@ def run_comparison(live: LiveRun, request: RunRequest) -> None:
 
     direct_repo = live.runtime_root / "direct"
     supervised_repo = live.runtime_root / "supervised"
-    _run_command(["git", "clone", "--quiet", "--no-hardlinks", str(baseline), str(direct_repo)], live.runtime_root)
-    _run_command(["git", "clone", "--quiet", "--no-hardlinks", str(baseline), str(supervised_repo)], live.runtime_root)
+    _run_command(["git", "-c", "core.autocrlf=false", "clone", "--quiet", "--no-hardlinks", str(baseline), str(direct_repo)], live.runtime_root)
+    _run_command(["git", "-c", "core.autocrlf=false", "clone", "--quiet", "--no-hardlinks", str(baseline), str(supervised_repo)], live.runtime_root)
     configure_temporary_clone(direct_repo)
     configure_temporary_clone(supervised_repo)
 
@@ -602,13 +671,14 @@ def run_comparison(live: LiveRun, request: RunRequest) -> None:
     live.event_lane = "direct"
     live.working_repo_path = direct_repo
     live.emit("comparison", {"lane": "direct", "status": "RUNNING", "message": "直接运行 Worker；所有监督门禁均关闭。"})
+    direct_started = time.perf_counter()
     try:
         direct_task = write_ui_task_file(direct_repo, f"{live.run_id}-direct", request)
         direct_result = run_direct_case(
             repo_path=direct_repo,
             task_file=direct_task,
-            allowed_globs=request.allowed_globs,
-            test_commands=request.test_commands,
+            allowed_globs=effective_allowed_globs(request),
+            test_commands=effective_test_commands(request),
             timeout_seconds=float(request.worker_timeout_seconds),
             worker_name=request.worker,
         )
@@ -616,6 +686,9 @@ def run_comparison(live: LiveRun, request: RunRequest) -> None:
         direct_report["lane"] = "direct"
         direct_report["source_mode"] = "comparison_isolated"
         direct_report["writeback"] = {"status": "COMPARISON_ONLY", "applied": False, "files": []}
+        attach_delivery_evaluation(
+            direct_report, direct_repo, request, live.run_id, "direct", time.perf_counter() - direct_started,
+        )
         live.emit("lane_report", {"lane": "direct", "report": direct_report})
     except Exception as exc:
         direct_report = {
@@ -627,8 +700,11 @@ def run_comparison(live: LiveRun, request: RunRequest) -> None:
             "passive_scope_violation": False,
             "passive_forbidden_path_touch": False,
             "passive_security_findings": [],
-            "passive_required_commands_missing": request.test_commands,
+            "passive_required_commands_missing": effective_test_commands(request),
         }
+        attach_delivery_evaluation(
+            direct_report, direct_repo, request, live.run_id, "direct", time.perf_counter() - direct_started,
+        )
         live.emit("lane_report", {"lane": "direct", "report": direct_report})
 
     if live.cancel_requested:
@@ -640,13 +716,14 @@ def run_comparison(live: LiveRun, request: RunRequest) -> None:
     live.event_lane = "supervised"
     live.working_repo_path = supervised_repo
     live.emit("comparison", {"lane": "supervised", "status": "RUNNING", "message": "启动 AgentGuard 门禁、回滚和纠正流程。"})
+    supervised_started = time.perf_counter()
     supervised_task = write_ui_task_file(supervised_repo, f"{live.run_id}-supervised", request)
     config = RunConfig(
         workspace_root=supervised_repo.parent,
         repo_path=supervised_repo,
         task_file=supervised_task,
-        allowed_globs=request.allowed_globs,
-        test_commands=request.test_commands,
+        allowed_globs=effective_allowed_globs(request),
+        test_commands=effective_test_commands(request),
         max_repair_rounds=request.max_repair_rounds,
         max_files=request.max_files,
         max_diff_lines=request.max_diff_lines,
@@ -662,6 +739,9 @@ def run_comparison(live: LiveRun, request: RunRequest) -> None:
     supervised_report["source_mode"] = "comparison_isolated"
     supervised_report["source_path"] = str(live.repo_path)
     supervised_report["writeback"] = {"status": "COMPARISON_ONLY", "applied": False, "files": []}
+    attach_delivery_evaluation(
+        supervised_report, supervised_repo, request, live.run_id, "supervised", time.perf_counter() - supervised_started,
+    )
     live.emit("lane_report", {"lane": "supervised", "report": supervised_report})
 
     summary = comparison_summary(direct_report, supervised_report)
@@ -711,12 +791,13 @@ def run_agentguard(live: LiveRun, request: RunRequest) -> None:
         )
 
         synthetic_source = live.source_mode == "temporary_git_baseline"
+        supervised_started = time.perf_counter()
         config = RunConfig(
             workspace_root=repo.parent,
             repo_path=repo,
             task_file=task_file,
-            allowed_globs=request.allowed_globs,
-            test_commands=request.test_commands,
+            allowed_globs=effective_allowed_globs(request),
+            test_commands=effective_test_commands(request),
             max_repair_rounds=request.max_repair_rounds,
             max_files=request.max_files,
             max_diff_lines=request.max_diff_lines,
@@ -730,6 +811,9 @@ def run_agentguard(live: LiveRun, request: RunRequest) -> None:
         report = to_dict(outcome.evidence_report)
         report["source_mode"] = live.source_mode
         report["source_path"] = str(source)
+        attach_delivery_evaluation(
+            report, repo, request, live.run_id, "supervised", time.perf_counter() - supervised_started,
+        )
         if synthetic_source:
             if not request.apply_patch:
                 report["writeback"] = {"status": "NOT_REQUESTED", "applied": False, "files": []}
@@ -1047,6 +1131,45 @@ def cancel_run(run_id: str) -> dict[str, str]:
             request_cancel(path, run_id)
     live.emit("run", {"status": "CANCEL_REQUESTED", "message": "已请求停止当前运行；A/B 模式不会再启动下一路。"})
     return {"status": "CANCEL_REQUESTED"}
+
+
+ARTIFACT_SUFFIXES = {
+    ".html", ".css", ".js", ".mjs", ".json", ".png", ".jpg", ".jpeg",
+    ".gif", ".webp", ".ico", ".woff", ".woff2", ".ttf", ".map",
+    ".mp3", ".wav",
+}
+
+
+@app.get("/api/runs/{run_id}/artifacts/{lane}/{artifact_path:path}")
+def run_artifact(run_id: str, lane: Literal["direct", "supervised"], artifact_path: str) -> FileResponse:
+    live = runs.get(run_id)
+    if live is None:
+        raise HTTPException(404, "未找到运行会话")
+    if live.comparison_mode and live.runtime_root is not None:
+        root = (live.runtime_root / lane).resolve()
+    elif lane == "supervised" and live.working_repo_path is not None:
+        root = live.working_repo_path.resolve()
+    else:
+        raise HTTPException(404, "该运行没有对应产物")
+
+    relative = Path(artifact_path)
+    if relative.is_absolute() or any(part.startswith(".") for part in relative.parts):
+        raise HTTPException(403, "拒绝访问内部运行文件")
+    target = (root / relative).resolve()
+    if not target.is_relative_to(root) or not target.is_file():
+        raise HTTPException(404, "产物文件不存在")
+    if target.suffix.lower() not in ARTIFACT_SUFFIXES or target.stat().st_size > 10 * 1024 * 1024:
+        raise HTTPException(403, "该产物类型不允许预览")
+
+    headers = {
+        "Cache-Control": "no-store",
+        "Content-Security-Policy": (
+            "default-src 'self' data: blob:; script-src 'self' 'unsafe-inline' blob:; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' data: blob:; "
+            "connect-src 'none'; frame-ancestors 'self'"
+        ),
+    }
+    return FileResponse(target, headers=headers)
 
 
 @app.get("/api/runs/{run_id}/events")
