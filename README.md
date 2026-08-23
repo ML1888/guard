@@ -43,4 +43,4 @@ npm install
 - `GET /api/runs/{run_id}/events`：通过 SSE 推送运行、监督阶段和报告。
 - `POST /api/runs/{run_id}/cancel`：在安全检查点请求停止运行。
 
-Git 项目直接使用现有基线。普通文件夹会被只读复制到 `.agentguard-runtime/non-git-runs`，后台在临时副本中建立 Git 基线，因此不会在用户目录创建 `.git`。写回前会比较源文件哈希；检测到运行期间的并发修改时拒绝覆盖。
+Git 项目直接使用现有基线。普通文件夹会被只读复制到系统临时目录下的 `agentguard-live-console/non-git-runs`，后台在临时副本中建立 Git 基线，因此不会在用户目录创建 `.git`。依赖目录、构建产物、缓存、`logs` 和目录联接不会复制。写回前会比较源文件哈希；检测到运行期间的并发修改时拒绝覆盖。

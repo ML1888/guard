@@ -15,6 +15,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tomllib
@@ -272,11 +273,16 @@ def _streaming_stage_finish(self: Any, payload: dict[str, object], status: str =
 agentguard_orchestrator.StageTimer.finish = _streaming_stage_finish
 
 
-NON_GIT_RUNTIME_ROOT = PROJECT_ROOT / ".agentguard-runtime" / "non-git-runs"
+NON_GIT_RUNTIME_ROOT = Path(
+    os.environ.get(
+        "AGENTGUARD_RUNTIME_ROOT",
+        Path(tempfile.gettempdir()) / "agentguard-live-console" / "non-git-runs",
+    )
+).resolve()
 NON_GIT_EXCLUDED_NAMES = {
     ".git", ".agent-review", ".agentguard-runtime", ".idea", "__pycache__",
     ".pytest_cache", ".mypy_cache", ".ruff_cache", "node_modules", "dist",
-    "build", "coverage", ".next", ".venv", "venv", "target", ".env",
+    "build", "coverage", ".next", ".venv", "venv", "target", "logs", ".env",
     ".env.local", ".env.production", "credentials.json",
 }
 NON_GIT_MAX_FILES = 30_000
@@ -295,14 +301,19 @@ def _run_command(command: list[str], cwd: Path) -> subprocess.CompletedProcess[s
     )
 
 
+def _is_link_like(path: Path) -> bool:
+    try:
+        is_junction = getattr(path, "is_junction", None)
+        return path.is_symlink() or bool(is_junction and is_junction())
+    except OSError:
+        return True
+
+
 def _non_git_ignore(folder: str, names: list[str]) -> set[str]:
     base = Path(folder)
     ignored = {name for name in names if name in NON_GIT_EXCLUDED_NAMES}
     for name in names:
-        try:
-            if (base / name).is_symlink():
-                ignored.add(name)
-        except OSError:
+        if _is_link_like(base / name):
             ignored.add(name)
     return ignored
 
@@ -314,11 +325,11 @@ def validate_non_git_source(source: Path) -> dict[str, int]:
         base = Path(folder)
         dir_names[:] = [
             name for name in dir_names
-            if name not in NON_GIT_EXCLUDED_NAMES and not (base / name).is_symlink()
+            if name not in NON_GIT_EXCLUDED_NAMES and not _is_link_like(base / name)
         ]
         for name in file_names:
             path = base / name
-            if name in NON_GIT_EXCLUDED_NAMES or path.is_symlink():
+            if name in NON_GIT_EXCLUDED_NAMES or _is_link_like(path):
                 continue
             try:
                 total_bytes += path.stat().st_size
@@ -363,7 +374,14 @@ def prepare_non_git_repository(live: LiveRun) -> Path:
     runtime_root = NON_GIT_RUNTIME_ROOT / live.run_id
     repo = runtime_root / "repo"
     runtime_root.mkdir(parents=True, exist_ok=False)
-    shutil.copytree(source, repo, ignore=_non_git_ignore, copy_function=shutil.copy2)
+    try:
+        shutil.copytree(source, repo, ignore=_non_git_ignore, copy_function=shutil.copy2)
+    except (OSError, shutil.Error) as exc:
+        shutil.rmtree(runtime_root, ignore_errors=True)
+        raise RuntimeError(
+            "普通文件夹复制失败。请避免选择包含大量日志或失效目录联接的上级工作区，"
+            "并尽量直接选择需要修改的项目文件夹。"
+        ) from exc
     _run_command(["git", "init"], repo)
     _run_command(["git", "config", "core.autocrlf", "false"], repo)
     git_exclude = repo / ".git" / "info" / "exclude"
@@ -486,7 +504,11 @@ def apply_non_git_changes(live: LiveRun) -> dict[str, Any]:
 
 
 def run_agentguard(live: LiveRun, request: RunRequest) -> None:
-    old_env = {key: os.environ.get(key) for key in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "AGENT_REVIEW_CODEX_MODEL")}
+    managed_env = (
+        "OPENAI_API_KEY", "OPENAI_BASE_URL", "AGENT_REVIEW_CODEX_MODEL",
+        "PATH", "ELECTRON_RUN_AS_NODE",
+    )
+    old_env = {key: os.environ.get(key) for key in managed_env}
     context_token = active_live_run.set(live)
     try:
         source = live.repo_path
@@ -527,6 +549,11 @@ def run_agentguard(live: LiveRun, request: RunRequest) -> None:
             os.environ["OPENAI_BASE_URL"] = request.api_base_url
         if request.model:
             os.environ["AGENT_REVIEW_CODEX_MODEL"] = request.model
+        if request.worker == "codex":
+            native_codex = configured_codex_cli_path()
+            if native_codex is not None:
+                os.environ["PATH"] = str(native_codex.parent) + os.pathsep + os.environ.get("PATH", "")
+            os.environ.pop("ELECTRON_RUN_AS_NODE", None)
         synthetic_source = live.source_mode == "temporary_git_baseline"
         config = RunConfig(
             workspace_root=repo.parent,
@@ -582,16 +609,38 @@ def run_agentguard(live: LiveRun, request: RunRequest) -> None:
         execution_lock.release()
 
 
+def read_codex_config() -> dict[str, Any]:
+    config_path = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "config.toml"
+    try:
+        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    return config if isinstance(config, dict) else {}
+
+
+def configured_codex_cli_path() -> Path | None:
+    configured = os.environ.get("CODEX_CLI_PATH", "").strip()
+    if not configured:
+        config = read_codex_config()
+        mcp_servers = config.get("mcp_servers", {})
+        if isinstance(mcp_servers, dict):
+            node_repl = mcp_servers.get("node_repl", {})
+            if isinstance(node_repl, dict):
+                node_env = node_repl.get("env", {})
+                if isinstance(node_env, dict):
+                    configured = str(node_env.get("CODEX_CLI_PATH", "")).strip()
+    if not configured:
+        return None
+    path = Path(configured).expanduser().resolve()
+    return path if path.is_file() else None
+
+
 def codex_model_settings() -> dict[str, str]:
     configured_model = os.environ.get("AGENT_REVIEW_CODEX_MODEL", "").strip()
     settings = {"model": configured_model, "reasoning_effort": "", "service_tier": ""}
     if configured_model:
         return settings
-    config_path = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "config.toml"
-    try:
-        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError):
-        return settings
+    config = read_codex_config()
     settings["model"] = str(config.get("model", ""))
     settings["reasoning_effort"] = str(config.get("model_reasoning_effort", ""))
     settings["service_tier"] = str(config.get("service_tier", ""))
