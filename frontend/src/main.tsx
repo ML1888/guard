@@ -47,7 +47,20 @@ import "./styles.css";
 
 type RunState = "IDLE" | "QUEUED" | "RUNNING" | "PASS" | "FAIL" | "NEEDS_HUMAN" | "FAILED" | "CANCEL_REQUESTED";
 type Trace = { stage: string; status: string; started_at: string; duration_ms: number; payload: Record<string, unknown>; lane?: "direct" | "supervised" };
-type RunEvent = { id: string; kind: "run" | "trace" | "report" | "runtime_error" | "comparison" | "lane_report" | "comparison_report"; at: number; payload: Trace | Record<string, unknown> };
+type DecisionEvent = {
+  lane: "direct" | "supervised";
+  phase: "PLAN" | "INSPECT" | "ACTION" | "RISK" | "BLOCK" | "CORRECTION" | "REVISED_PLAN" | "VERIFY" | "DELIVER";
+  title: string;
+  summary: string;
+  source: "worker_declared" | "observed_action" | "supervisor_assessment" | "verification_evidence";
+  status: "observed" | "passed" | "blocked";
+  stage: string;
+  decision: string;
+  related_files: string[];
+  evidence: string[];
+  required_action: string;
+};
+type RunEvent = { id: string; kind: "run" | "trace" | "decision_event" | "report" | "runtime_error" | "comparison" | "lane_report" | "comparison_report"; at: number; payload: Trace | DecisionEvent | Record<string, unknown> };
 type ProjectNode = { title: string; key: string; is_leaf: boolean; children?: ProjectNode[] };
 type ProjectInfo = { path: string; name: string; is_git: boolean; tree: ProjectNode[] };
 type ChatMessage = {
@@ -173,6 +186,87 @@ function normalizeTree(nodes: ProjectNode[]): Array<Record<string, unknown>> {
   }));
 }
 
+const phaseLabels: Record<DecisionEvent["phase"], string> = {
+  PLAN: "计划", INSPECT: "检查", ACTION: "动作", RISK: "风险", BLOCK: "阻止",
+  CORRECTION: "纠正", REVISED_PLAN: "修订计划", VERIFY: "验证", DELIVER: "交付",
+};
+
+const sourceLabels: Record<DecisionEvent["source"], string> = {
+  worker_declared: "Worker 公开说明",
+  observed_action: "系统观察",
+  supervisor_assessment: "监督判断",
+  verification_evidence: "验证证据",
+};
+
+function reportTimeline(report: Record<string, unknown> | null): DecisionEvent[] {
+  return report && Array.isArray(report.decision_timeline) ? report.decision_timeline as DecisionEvent[] : [];
+}
+
+type CompactDecision = { event: DecisionEvent; responses: DecisionEvent[] };
+
+function compactTimeline(events: DecisionEvent[]): CompactDecision[] {
+  const selected = new Set<number>();
+  const firstPlan = events.findIndex((item) => item.phase === "PLAN");
+  const firstAction = events.findIndex((item) => item.phase === "ACTION");
+  const issue = events.findIndex((item) => item.status === "blocked" && ["RISK", "BLOCK"].includes(item.phase));
+  const correction = events.findIndex((item) => item.phase === "CORRECTION");
+  const revised = events.findIndex((item) => item.phase === "REVISED_PLAN");
+  const repairedAction = events.findIndex((item, index) => item.phase === "ACTION" && index > Math.max(issue, correction, revised));
+  const verificationCandidates = events
+    .map((item, index) => ({ item, index }))
+    .filter(({ item }) => item.phase === "VERIFY" && item.decision !== "NOT_APPLICABLE");
+  const verification = verificationCandidates.length ? verificationCandidates[verificationCandidates.length - 1].index : -1;
+  const deliveries = events.map((item, index) => ({ item, index })).filter(({ item }) => item.phase === "DELIVER");
+  const delivery = deliveries.length ? deliveries[deliveries.length - 1].index : -1;
+
+  [firstPlan, firstAction, issue, repairedAction, verification, delivery, events.length - 1].forEach((index) => {
+    if (index >= 0) selected.add(index);
+  });
+
+  const responseIndexes = new Set<number>();
+  if (issue >= 0) {
+    events.forEach((item, index) => {
+      if (index > issue && index < (repairedAction >= 0 ? repairedAction : events.length)
+        && ["BLOCK", "CORRECTION", "REVISED_PLAN"].includes(item.phase)) responseIndexes.add(index);
+    });
+  }
+  const responses = [...responseIndexes].map((index) => events[index]);
+  return [...selected]
+    .filter((index) => !responseIndexes.has(index))
+    .sort((left, right) => left - right)
+    .map((index) => ({ event: events[index], responses: index === issue ? responses : [] }));
+}
+
+function DecisionTimeline({ events, emptyText = "等待可审计事件" }: { events: DecisionEvent[]; emptyText?: string }) {
+  const [expanded, setExpanded] = useState(false);
+  if (events.length === 0) return <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={emptyText} />;
+  const compact = compactTimeline(events);
+  const visible = expanded ? events.map((event) => ({ event, responses: [] })) : compact;
+  return <div className="decision-timeline">
+    {visible.map(({ event, responses }, index) => {
+      const details = [...event.related_files, ...event.evidence];
+      return <article className={`decision-node phase-${event.phase.toLowerCase()} ${event.status}`} key={`${event.lane}-${event.stage}-${index}`}>
+        <span className="decision-marker">{event.status === "blocked" ? <CloseCircleFilled /> : event.status === "passed" ? <CheckCircleFilled /> : <BranchesOutlined />}</span>
+        <div className="decision-body">
+          <div className="decision-heading"><Tag>{phaseLabels[event.phase]}</Tag><b>{event.title}</b><small>{sourceLabels[event.source]}</small></div>
+          <p>{event.summary}</p>
+          {event.required_action && responses.length === 0 && <div className="decision-action"><b>下一步</b>{event.required_action}</div>}
+          {responses.length > 0 && <div className="supervisor-response">
+            <b><SafetyCertificateFilled />监督响应</b>
+            {responses.map((response, responseIndex) => <div key={`${response.stage}-${responseIndex}`}>
+              <Tag>{phaseLabels[response.phase]}</Tag><span>{response.title}</span><small>{response.summary}</small>
+            </div>)}
+          </div>}
+          {details.length > 0 && <details><summary>查看依据（{details.length}）</summary>{details.map((item, itemIndex) => <code key={`${item}-${itemIndex}`}>{item}</code>)}</details>}
+        </div>
+      </article>;
+    })}
+    {events.length > compact.length && <Button className="timeline-toggle" type="link" size="small" onClick={() => setExpanded((value) => !value)}>
+      {expanded ? "收起到关键步骤" : `展开全部 ${events.length} 个步骤`}
+    </Button>}
+  </div>;
+}
+
 function ReportDetails({ report }: { report: Record<string, unknown> }) {
   const review = asRecord(report.final_review);
   const rollback = asRecord(report.rollback);
@@ -205,7 +299,7 @@ function ReportDetails({ report }: { report: Record<string, unknown> }) {
   </div>;
 }
 
-function ComparisonBoard({ lanes, traces, running }: { lanes: ComparisonLanes; traces: Trace[]; running: boolean }) {
+function ComparisonBoard({ lanes, traces, decisions, running }: { lanes: ComparisonLanes; traces: Trace[]; decisions: DecisionEvent[]; running: boolean }) {
   const direct = lanes.direct.report;
   const supervised = lanes.supervised.report;
   const directFiles = direct ? stringList(direct.changed_files) : [];
@@ -214,7 +308,10 @@ function ComparisonBoard({ lanes, traces, running }: { lanes: ComparisonLanes; t
   const supervisedReview = asRecord(supervised?.final_review);
   const directEvidence = stringList(directReview.test_evidence);
   const supervisedEvidence = stringList(supervisedReview.test_evidence);
-  const directScopeViolation = Boolean(direct?.passive_scope_violation || direct?.passive_forbidden_path_touch);
+  const directScopeExpansion = Boolean(direct?.passive_scope_violation);
+  const directForbiddenTouch = Boolean(direct?.passive_forbidden_path_touch);
+  const directWeakening = asRecord(direct?.passive_test_weakening);
+  const directWeakeningDetected = Boolean(directWeakening.detected);
   const directSecurity = direct ? stringList(direct.passive_security_findings) : [];
   const directMissing = direct ? stringList(direct.passive_required_commands_missing) : [];
   const interventions = supervised && Array.isArray(supervised.interventions) ? supervised.interventions.length : 0;
@@ -222,7 +319,7 @@ function ComparisonBoard({ lanes, traces, running }: { lanes: ComparisonLanes; t
   const rollbackApplied = Boolean(rollback.rollback_applied);
   const directDecision = String(direct?.final_decision || (running ? "RUNNING" : "WAITING"));
   const supervisedDecision = String(supervised?.final_decision || (running ? "RUNNING" : "WAITING"));
-  const directRisk = directScopeViolation || directSecurity.length > 0 || directMissing.length > 0;
+  const directRisk = directWeakeningDetected || directForbiddenTouch || directSecurity.length > 0;
   const supervisedTraceCount = traces.filter((item) => item.lane === "supervised").length;
   const directEvaluation = asRecord(direct?.delivery_evaluation);
   const supervisedEvaluation = asRecord(supervised?.delivery_evaluation);
@@ -233,7 +330,7 @@ function ComparisonBoard({ lanes, traces, running }: { lanes: ComparisonLanes; t
   if (direct && supervised && directScore !== null && supervisedScore !== null && supervisedScore > directScore) {
     conclusion = `同一验收契约下，AgentGuard 自动验收得分比 Direct 高 ${supervisedScore - directScore} 分；失败证据触发了受监督的检查与纠正。`;
   } else if (direct && supervised && directRisk && (interventions > 0 || rollbackApplied)) {
-    conclusion = "直接运行虽然可能显示 PASS，但存在越界或证据缺失；AgentGuard 已介入并回滚风险修改，交付结果更可信。";
+    conclusion = "直接运行虽然显示 PASS，但产生了测试弱化或其他高风险修改；AgentGuard 已阻止并回滚风险修改，再纠正业务实现。";
   } else if (direct && supervised && directScore !== null && directScore === supervisedScore) {
     conclusion = `本次两侧自动验收得分同为 ${directScore}；AgentGuard 的额外价值体现在约束执行、证据链和可回滚性，而非人为制造 Direct 缺陷。`;
   } else if (direct && supervised) {
@@ -259,6 +356,9 @@ function ComparisonBoard({ lanes, traces, running }: { lanes: ComparisonLanes; t
     const previewUrl = String(evaluation.preview_url || "");
     const elapsed = typeof metrics.elapsed_seconds === "number" ? `${metrics.elapsed_seconds.toFixed(1)}s` : "—";
     const attempts = typeof metrics.worker_attempts === "number" ? metrics.worker_attempts : 1;
+    const liveLaneEvents = decisions.filter((item) => item.lane === kind);
+    const finalLaneEvents = reportTimeline(report);
+    const laneEvents = finalLaneEvents.length ? finalLaneEvents : liveLaneEvents;
     const decisionColor = decision === "PASS" && (!isDirect || !directRisk) ? "success" : decision === "RUNNING" ? "processing" : decision === "WAITING" ? "default" : "warning";
     return <section className={`comparison-lane ${kind}`}>
       <div className="lane-header">
@@ -271,19 +371,21 @@ function ComparisonBoard({ lanes, traces, running }: { lanes: ComparisonLanes; t
         <div><span>自动验收</span><b>{score === null ? "未评测" : `${score}/100`}</b></div>
         <div><span>缺失能力</span><b>{score === null ? "—" : failedChecks.length}</b></div>
         <div><span>运行耗时</span><b>{elapsed}</b></div>
-        <div><span>{isDirect ? "事后风险" : "监督介入"}</span><b>{isDirect ? Number(directRisk) : interventions}</b></div>
+        <div><span>{isDirect ? "高风险" : "监督介入"}</span><b>{isDirect ? Number(directRisk) : interventions}</b></div>
       </div>
       <div className="lane-evidence">
+        {report && (isDirect ? <div className={`finding ${directRisk ? "danger" : "ok"}`}>
+          {directRisk ? <WarningFilled /> : <CheckCircleFilled />}
+          <span>{directWeakeningDetected ? "测试被弱化，表面 PASS 不能证明业务功能正确" : directRisk ? "存在未处理的高风险修改" : directScopeExpansion ? "修改范围有所扩展，但未发现高风险行为" : "未发现高风险行为"}</span>
+        </div> : <div className={`finding ${interventions || rollbackApplied ? "protected" : "ok"}`}>
+          <SafetyCertificateFilled />
+          <span>{interventions || rollbackApplied ? `已执行 ${interventions} 次介入${rollbackApplied ? "并完成回滚" : ""}` : "监督门禁未发现需要阻止的行为"}</span>
+        </div>)}
+        <div className="lane-trace-title"><b>可审计决策轨迹</b><span>不包含模型隐藏思维链</span></div>
+        <DecisionTimeline events={laneEvents} emptyText={laneState.status === "WAITING" ? "等待该侧运行" : "正在采集决策证据"} />
         {!report && <Skeleton active paragraph={{ rows: 4 }} title={false} />}
-        {report && <>
-          {isDirect && <div className={`finding ${directRisk ? "danger" : "ok"}`}>
-            {directRisk ? <WarningFilled /> : <CheckCircleFilled />}
-            <span>{directScopeViolation ? "检测到允许范围外的修改，但直接运行不会阻止它" : directRisk ? "存在未处理的交付风险" : "未发现明显越界修改"}</span>
-          </div>}
-          {!isDirect && <div className={`finding ${interventions || rollbackApplied ? "protected" : "ok"}`}>
-            <SafetyCertificateFilled />
-            <span>{interventions || rollbackApplied ? `已执行 ${interventions} 次介入${rollbackApplied ? "并完成回滚" : ""}` : "监督门禁未发现需要阻止的行为"}</span>
-          </div>}
+        {report && <details className="lane-more-details">
+          <summary>文件、测试与验收详情</summary>
           <div className="evidence-block"><b>实际修改</b>{files.length ? files.map((file) => <code key={file}>{file}</code>) : <span>无文件变更</span>}</div>
           <div className="evidence-block"><b>测试结果</b>{evidence.length ? evidence.map((item) => <span key={item}>{item}</span>) : <span>{String(report.verification_status || "UNKNOWN")}</span>}</div>
           {checks.length > 0 && <div className="contract-results">
@@ -295,12 +397,12 @@ function ComparisonBoard({ lanes, traces, running }: { lanes: ComparisonLanes; t
             <small className="evaluation-limit">{String(evaluation.limitations || "")}</small>
           </div>}
           {isDirect && directSecurity.map((item) => <span className="risk-line" key={item}>{item}</span>)}
-          {isDirect && directMissing.map((item) => <span className="risk-line" key={item}>Worker 未主动执行：{item}</span>)}
+          {isDirect && directMissing.map((item) => <span className="info-line" key={item}>执行证据说明：Worker 未主动执行 {item}</span>)}
           {previewUrl && <div className="artifact-preview">
             <div><b>可操作成品</b><span>在隔离 iframe 中运行</span></div>
             <iframe src={previewUrl} title={`${title}成品预览`} sandbox="allow-scripts" />
           </div>}
-        </>}
+        </details>}
       </div>
       <div className="lane-footer">{isDirect ? `1 次 Worker · 监督门禁关闭 · 仅事后测量` : `${attempts} 次 Worker · ${supervisedTraceCount} 个监督阶段 · ${rollbackApplied ? "已执行安全回滚" : "具备回滚能力"}`}</div>
     </section>;
@@ -323,6 +425,7 @@ function Console() {
   const [runState, setRunState] = useState<RunState>("IDLE");
   const [runId, setRunId] = useState("");
   const [traces, setTraces] = useState<Trace[]>([]);
+  const [decisionEvents, setDecisionEvents] = useState<DecisionEvent[]>([]);
   const [report, setReport] = useState<Record<string, unknown> | null>(null);
   const [settings, setSettings] = useState<Settings>(defaultSettings);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -372,6 +475,7 @@ function Console() {
     setProject(inspected.data);
     setMessages([]);
     setTraces([]);
+    setDecisionEvents([]);
     setReport(null);
     setComparisonLanes(emptyComparisonLanes());
     setRunState("IDLE");
@@ -384,6 +488,7 @@ function Console() {
     setWorkspaceMode(mode);
     setMessages([]);
     setTraces([]);
+    setDecisionEvents([]);
     setReport(null);
     setComparisonLanes(emptyComparisonLanes());
     setRunId("");
@@ -432,7 +537,7 @@ function Console() {
     const stream = new EventSource(`/api/runs/${id}/events`);
     streamRef.current = stream;
 
-    (["run", "trace", "report", "runtime_error", "comparison", "lane_report", "comparison_report"] as const).forEach((kind) => {
+    (["run", "trace", "decision_event", "report", "runtime_error", "comparison", "lane_report", "comparison_report"] as const).forEach((kind) => {
       stream.addEventListener(kind, (raw) => {
         if (!(raw instanceof MessageEvent)) return;
         let event: RunEvent;
@@ -453,6 +558,9 @@ function Console() {
               status: "RUNNING",
             });
           }
+        }
+        if (event.kind === "decision_event") {
+          setDecisionEvents((old) => [...old, event.payload as DecisionEvent]);
         }
         if (event.kind === "report") {
           const nextReport = asRecord(event.payload);
@@ -514,6 +622,7 @@ function Console() {
     ]);
     setPrompt("");
     setTraces([]);
+    setDecisionEvents([]);
     setReport(null);
     setComparisonLanes(emptyComparisonLanes());
     setRunState("QUEUED");
@@ -563,6 +672,7 @@ function Console() {
     if (isRunning) return;
     setMessages([]);
     setTraces([]);
+    setDecisionEvents([]);
     setReport(null);
     setComparisonLanes(emptyComparisonLanes());
     setRunId("");
@@ -664,7 +774,7 @@ function Console() {
               {item.report && <ReportDetails report={item.report} />}
             </div>
           </article>)}
-          {workspaceMode === "comparison" && messages.length > 0 && <ComparisonBoard lanes={comparisonLanes} traces={traces} running={isRunning} />}
+          {workspaceMode === "comparison" && messages.length > 0 && <ComparisonBoard lanes={comparisonLanes} traces={traces} decisions={decisionEvents} running={isRunning} />}
           <div ref={chatEndRef} />
         </section>
 
@@ -700,11 +810,10 @@ function Console() {
           <div><b>{stateLabels[runState]}</b><span>{traces.length} 个监督阶段</span></div>
         </div>
         <Divider />
-        <div className="trace-list">
-          {traces.length === 0 ? <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="等待任务" /> : traces.map((trace, index) => <div className="trace-item" key={`${trace.stage}-${index}`}>
-            <span className={`trace-dot ${trace.status === "OK" ? "ok" : "warn"}`}>{trace.status === "OK" ? <CheckCircleFilled /> : <CloseCircleFilled />}</span>
-            <div><b>{stageNames[trace.stage] || trace.stage}</b><p>{payloadText(trace.payload)}</p><small>{trace.duration_ms} ms</small></div>
-          </div>)}
+        <div className="trace-list decision-pane-list">
+          <div className="decision-pane-note">展示公开计划、实际动作、监督判断和验证证据，不展示模型隐藏思维链。</div>
+          <DecisionTimeline events={reportTimeline(report).length ? reportTimeline(report) : decisionEvents.filter((item) => item.lane === "supervised")} emptyText="等待任务" />
+          {traces.length > 0 && <details className="raw-stage-summary"><summary>原始监督阶段（{traces.length}）</summary>{traces.map((trace, index) => <div className="raw-stage" key={`${trace.stage}-${index}`}><b>{stageNames[trace.stage] || trace.stage}</b><span>{trace.status}</span></div>)}</details>}
         </div>
         {report && <div className="final-evidence">
           <span>最终证据</span>
