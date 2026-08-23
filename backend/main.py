@@ -503,6 +503,31 @@ def apply_non_git_changes(live: LiveRun) -> dict[str, Any]:
     }
 
 
+def write_ui_task_file(repo: Path, run_id: str, request: RunRequest) -> Path:
+    task_file = repo / ".agent-review" / "ui-tasks" / f"{run_id}.toml"
+    task_file.parent.mkdir(parents=True, exist_ok=True)
+    summary = request.task
+    if request.conversation_history:
+        history = "\n\n".join(
+            f"{turn.role.upper()}: {turn.content}" for turn in request.conversation_history
+        )
+        summary = f"{request.task}\n\nPrevious conversation context (use only when relevant):\n{history}"
+    task_file.write_text(
+        "\n".join(
+            [
+                f"summary = {json.dumps(summary, ensure_ascii=False)}",
+                f"goals = {json.dumps([request.task], ensure_ascii=False)}",
+                f"acceptance_criteria = {json.dumps([request.task], ensure_ascii=False)}",
+                f"allowed_paths = {json.dumps(request.allowed_globs, ensure_ascii=False)}",
+                f"required_tests = {json.dumps(request.test_commands, ensure_ascii=False)}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return task_file
+
+
 def run_agentguard(live: LiveRun, request: RunRequest) -> None:
     managed_env = (
         "OPENAI_API_KEY", "OPENAI_BASE_URL", "AGENT_REVIEW_CODEX_MODEL",
@@ -521,18 +546,7 @@ def run_agentguard(live: LiveRun, request: RunRequest) -> None:
             live.emit("run", {"status": "RUNNING", "message": "正在为普通文件夹创建临时监督基线。"})
             repo = prepare_non_git_repository(live)
 
-        task_file = repo / ".agent-review" / "ui-tasks" / f"{live.run_id}.md"
-        task_file.parent.mkdir(parents=True, exist_ok=True)
-        task_text = request.task
-        if request.conversation_history:
-            history = "\n\n".join(
-                f"{turn.role.upper()}: {turn.content}" for turn in request.conversation_history
-            )
-            task_text = (
-                "Previous conversation context (use only when relevant to the current task):\n\n"
-                f"{history}\n\nCURRENT USER TASK:\n{request.task}"
-            )
-        task_file.write_text(task_text, encoding="utf-8")
+        task_file = write_ui_task_file(repo, live.run_id, request)
         live.status = "RUNNING"
         live.emit(
             "run",
