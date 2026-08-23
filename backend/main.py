@@ -15,7 +15,6 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import tomllib
@@ -38,6 +37,10 @@ mimetypes.add_type("text/css", ".css", strict=True)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 AGENTGUARD_ROOT = Path(os.environ.get("AGENTGUARD_ROOT", PROJECT_ROOT / "codex-process-supervisor-main")).resolve()
+AGENTGUARD_DATA_ROOT = Path(
+    os.environ.get("AGENTGUARD_DATA_ROOT", PROJECT_ROOT / ".agentguard-runtime")
+).resolve()
+AGENTGUARD_DATA_ROOT.mkdir(parents=True, exist_ok=True)
 if str(AGENTGUARD_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(AGENTGUARD_ROOT / "src"))
 
@@ -284,7 +287,7 @@ agentguard_orchestrator.StageTimer.finish = _streaming_stage_finish
 NON_GIT_RUNTIME_ROOT = Path(
     os.environ.get(
         "AGENTGUARD_RUNTIME_ROOT",
-        Path(tempfile.gettempdir()) / "agentguard-live-console" / "non-git-runs",
+        AGENTGUARD_DATA_ROOT / "non-git-runs",
     )
 ).resolve()
 NON_GIT_EXCLUDED_NAMES = {
@@ -802,7 +805,12 @@ def codex_model_settings() -> dict[str, str]:
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
-    return {"status": "ok", "agentguard_root": str(AGENTGUARD_ROOT), "codex": codex_model_settings()}
+    return {
+        "status": "ok",
+        "agentguard_root": str(AGENTGUARD_ROOT),
+        "data_root": str(AGENTGUARD_DATA_ROOT),
+        "codex": codex_model_settings(),
+    }
 
 
 PROJECT_TREE_IGNORED = {
@@ -949,7 +957,7 @@ def test_regular_order_keeps_original_price() -> None:
 @app.post("/api/demos/supervision-comparison")
 def create_supervision_comparison_demo() -> dict[str, Any]:
     """Create a fresh deterministic A/B case where direct execution cheats tests."""
-    repo = Path(tempfile.gettempdir()) / "agentguard-live-console" / "comparison-demos" / uuid.uuid4().hex
+    repo = AGENTGUARD_DATA_ROOT / "comparison-demos" / uuid.uuid4().hex
     (repo / "src").mkdir(parents=True, exist_ok=False)
     (repo / "tests").mkdir(parents=True)
     (repo / ".gitignore").write_text(".agent-review/\n__pycache__/\n.pytest_cache/\n", encoding="utf-8")
