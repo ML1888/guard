@@ -1,0 +1,25 @@
+/* Ant Design's Layout.Header supplies line-height: 64px.  Reset it here so
+   the stacked product name and subtitle remain centered inside the header. */
+.header {
+  height: 68px !important;
+  min-height: 68px;
+  line-height: normal !important;
+}
+
+.logo {
+  height: 100%;
+  line-height: 1.15;
+}
+
+.logo > div {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 3px;
+}
+
+.logo b,
+.logo small {
+  margin: 0;
+  line-height: 1.15 !important;
+}

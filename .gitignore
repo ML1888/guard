@@ -1,0 +1,35 @@
+# Frontend dependencies and generated files
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
+
+# Python caches and test artifacts
+backend/__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# AgentGuard runtime data
+.agent-review/
+.agentguard-runtime/
+
+# Generated demo repository (contains its own Git metadata)
+demo-workspaces/vip-discount-drift-correction/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+credentials.json
+*.pem
+*.key
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

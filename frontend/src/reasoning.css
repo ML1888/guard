@@ -1,0 +1,22 @@
+.reasoning-card {
+  margin-top: 16px;
+  border: 1px solid #b9ddca !important;
+  box-shadow: 0 8px 24px rgba(22, 132, 91, 0.08);
+}
+
+.reasoning-lead { margin-bottom: 18px !important; }
+
+.reasoning-lane {
+  min-height: 320px;
+  padding: 18px 20px 6px;
+  border-radius: 10px;
+}
+
+.reasoning-lane h4 { margin-top: 0 !important; }
+.worker-lane { background: #f7faf8; border: 1px solid #e4ece7; }
+.supervisor-lane { background: #f1faf5; border: 1px solid #b9ddca; }
+.supervisor-lane h4 { color: #126a49; }
+.reasoning-lane .ant-steps-item-description { max-width: none !important; line-height: 1.7; }
+.reasoning-lane code { padding: 1px 5px; border-radius: 4px; background: #e7f5ed; color: #126a49; }
+.trace-collapse { margin-top: 16px; border-color: #dce8e1 !important; background: #fff; }
+.trace-collapse .ant-collapse-header { color: #536159 !important; }
